@@ -2,6 +2,7 @@ require('dotenv').config();
 const { createClient } = require('@supabase/supabase-js');
 const express = require('express');
 const path = require('path');
+const PDFDocument = require("pdfkit-table");
 
 const app = express();
 const PORT = 3000;
@@ -16,10 +17,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 //        ROTA: CASAS ESPÍRITAS (CSV)
 // ==========================================
 app.get('/api/casas-espiritas', async (req, res) => {
-  const { data, error } = await supabase
-    .from('casas_espiritas')
-    .select('*');
-
+  const { data, error } = await supabase.from('casas_espiritas').select('*');
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
@@ -39,7 +37,6 @@ app.get('/api/livros', async (req, res) => {
 
 app.post('/api/livros', async (req, res) => {
   const { titulo, autor, editora, tombo, classificacao, observacao, isbn } = req.body;
-  
   const { data, error } = await supabase
     .from('livros')
     .insert([{ titulo, autor, editora, tombo, classificacao, observacao, isbn, status: 'Disponível' }])
@@ -64,126 +61,147 @@ app.put('/api/livros/:id', async (req, res) => {
 });
 
 // ==========================================
+// ROTA PARA GERAR O RELATÓRIO MENSAL EM PDF
+// ==========================================
+app.get("/api/relatorios/pdf-mensal", async (req, res) => {
+    try {
+        const { data: libros, error } = await supabase
+            .from("livros")
+            .select("*")
+            .order("titulo", { ascending: true });
+
+        if (error) throw error;
+
+        let estoqueAgrupado = {};
+        libros.forEach(l => {
+            const tituloLimpo = (l.titulo || '').trim().replace(/\s+/g, ' ');
+            const autorLimpo = (l.autor || 'Desconhecido').trim().replace(/\s+/g, ' ');
+            const classificacaoLimpa = (l.classificacao || '-').trim();
+            const chaveUnica = `${tituloLimpo.toLowerCase()}|||${autorLimpo.toLowerCase()}`;
+
+            const statusAtual = (l.status || 'disponível').toLowerCase();
+            const ehDisponivel = (statusAtual !== 'emprestado' && statusAtual !== 'doado');
+
+            if (!estoqueAgrupado[chaveUnica]) {
+                estoqueAgrupado[chaveUnica] = {
+                    titulo: tituloLimpo,
+                    autor: autorLimpo,
+                    classificacao: classificacaoLimpa,
+                    totalExemplares: 0,
+                    totalDisponiveis: 0
+                };
+            }
+
+            estoqueAgrupado[chaveUnica].totalExemplares += 1;
+            if (ehDisponivel) {
+                estoqueAgrupado[chaveUnica].totalDisponiveis += 1;
+            }
+        });
+
+        const listaEstoque = Object.values(estoqueAgrupado);
+        
+        const doc = new PDFDocument({ 
+            size: "A4",
+            margins: { top: 50, bottom: 60, left: 30, right: 30 },
+            bufferPages: true 
+        });
+
+        res.setHeader("Content-Type", "application/pdf");
+        res.setHeader("Content-Disposition", "attachment; filename=Relatorio-Inventario-Mensal.pdf");
+        doc.pipe(res);
+
+        doc.y = 110;
+
+        const linhasTabela = listaEstoque.map(item => [
+            item.titulo,
+            item.autor,
+            item.classificacao,
+            item.totalExemplares.toString(),
+            item.totalDisponiveis.toString()
+        ]);
+
+        const tabelaConfig = {
+            headers: [
+                { label: "Título do Livro", property: "0", width: 180, headerColor: "#2c3e50" },
+                { label: "Autor", property: "1", width: 140, headerColor: "#2c3e50" },
+                { label: "Classif.", property: "2", width: 75, headerColor: "#2c3e50" },
+                { label: "Total Est.", property: "3", width: 70, headerColor: "#2c3e50" },
+                { label: "Disp. Agora", property: "4", width: 70, headerColor: "#2c3e50" }
+            ],
+            rows: linhasTabela,
+            options: {
+                padding: 5,
+                fontSize: 10,
+                fontFamily: "Helvetica",
+                prepareHeader: () => {
+                    const numeroPaginaAtual = doc.bufferedPageRange().count;
+                    if (numeroPaginaAtual > 1) {
+                        return doc.font("Helvetica-Bold").fontSize(0.01).fillColor("#ffffff");
+                    }
+                    return doc.font("Helvetica-Bold").fontSize(10).fillColor("#ffffff");
+                },
+                prepareRow: (row, i) => doc.font("Helvetica").fontSize(10).fillColor("#333333")
+            }
+        };
+
+        doc.on('pageAdded', () => {
+            doc.y = 110;
+            tabelaConfig.headers.forEach(h => { h.headerColor = "#ffffff"; });
+        });
+
+        await doc.table(tabelaConfig);
+
+        const rangePaginas = doc.bufferedPageRange();
+        const totalPaginas = rangePaginas.count;
+
+        for (let i = 0; i < totalPaginas; i++) {
+            doc.switchToPage(i);
+
+            const logoFederativa = path.join(__dirname, 'public', 'logo-federativa.png');
+            const logoFeesp = path.join(__dirname, 'public', 'logo-feesp.png');
+
+            try { doc.image(logoFederativa, 30, 20, { width: 75 }); } catch(e) { }
+            try { doc.image(logoFeesp, 490, 20, { width: 90 }); } catch(e) { }
+
+            doc.fontSize(12).font("Helvetica-Bold").fillColor("#2c3e50").text("FEDERAÇÃO ESPÍRITA DO ESTADO DE SÃO PAULO", 110, 25, { align: "center", width: 375 });
+            doc.fontSize(8).font("Helvetica").fillColor("#7f8c8d").text("Área Federativa - Gestão de Controle de Acervos", 110, 40, { align: "center", width: 375 });
+            
+            doc.moveTo(30, 75).lineTo(565, 75).strokeColor("#eee").stroke();
+
+            doc.moveTo(30, 755).lineTo(565, 755).strokeColor("#eee").stroke();
+            doc.fontSize(8).font("Helvetica-Bold").fillColor("#2c3e50").text(`Página ${i + 1} de ${totalPaginas}`, 30, 762, { align: "right", width: 535 });
+        }
+
+        doc.end();
+
+    } catch (err) {
+        console.error("Erro controlado capturado na geração do PDF:", err);
+        if (!res.headersSent) { res.status(500).json({ erro: "Erro interno ao processar PDF." }); }
+    }
+});
+
+// ==========================================
 //           ROTAS DE LEITORES
 // ==========================================
 app.get('/api/leitores', async (req, res) => {
-  const { data, error } = await supabase
-    .from('leitores')
-    .select('*')
-    .order('nome', { ascending: true });
-
+  const { data, error } = await supabase.from('leitores').select('*').order('nome', { ascending: true });
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
 
 app.post('/api/leitores', async (req, res) => {
   const { cpf, nome, endereco, numero, bairro, estado, cep, whatsapp, status } = req.body;
-  
-  const { data, error } = await supabase
-    .from('leitores')
-    .insert([{ cpf, nome, endereco, numero, bairro, estado, cep, whatsapp, status: status || 'Ativo' }])
-    .select();
-
-  if (error) return res.status(500).json({ error: error.message });
-  res.status(200).json({ success: true, data });
-});
-
-app.put('/api/leitores/:cpf', async (req, res) => {
-  const { cpf } = req.params;
-  const { nome, endereco, numero, bairro, estado, cep, whatsapp, status } = req.body;
-
-  const { data, error } = await supabase
-    .from('leitores')
-    .update({ nome, endereco, numero, bairro, estado, cep, whatsapp, status })
-    .eq('cpf', cpf)
-    .select();
-
-  if (error) return res.status(500).json({ error: error.message });
-  res.json({ success: true, data });
-});
-
-// ==========================================
-//           ROTAS DE EMPRÉSTIMOS
-// ==========================================
-app.get('/api/emprestimos', async (req, res) => {
-  const { data, error } = await supabase
-    .from('emprestimos')
-    .select('*, livros(titulo)')
-    .eq('status', 'Ativo')
-    .order('id', { ascending: false });
-    
+  const { data, error } = await supabase.from('leitores').insert([{ cpf, nome, endereco, numero, bairro, estado, cep, whatsapp, status }]).select();
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
 
-app.post('/api/emprestimos', async (req, res) => {
-  const { livro_id, nome_leitor } = req.body;
-
-  const { error: empError } = await supabase
-    .from('emprestimos')
-    .insert([{ livro_id, nome_leitor, status: 'Ativo' }]);
-
-  if (empError) return res.status(500).json({ error: empError.message });
-
-  await supabase.from('livros').update({ status: 'Emprestado' }).eq('id', livro_id);
-  res.json({ success: true });
-});
-
-app.post('/api/emprestimos/devolver', async (req, res) => {
-  const { id, livro_id } = req.body;
-
-  await supabase.from('emprestimos').update({ status: 'Concluído', data_devolucao_real: new Date() }).eq('id', id);
-  await supabase.from('livros').update({ status: 'Disponível' }).eq('id', livro_id);
-
-  res.json({ success: true });
-});
-
-// ==========================================
-//           ROTAS DE DOAÇÕES
-// ==========================================
-app.get('/api/doacoes', async (req, res) => {
-  const { data, error } = await supabase
-    .from('doacoes')
-    .select('*, livros(titulo)')
-    .order('id', { ascending: false });
-
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
-});
-
-app.post('/api/doacoes', async (req, res) => {
-  const { tipo, doador_ou_destinatario, titulo, livro_id } = req.body;
-  let finalLivroId = livro_id;
-
-  if (tipo === 'Recebida') {
-    const { data: novoLivro, error: livroError } = await supabase
-      .from('livros')
-      .insert([{ titulo, status: 'Disponível', autor: 'Doador', editora: 'Doação' }])
-      .select();
-
-    if (livroError) return res.status(500).json({ error: livroError.message });
-    finalLivroId = novoLivro[0].id;
-  } else {
-    await supabase.from('livros').update({ status: 'Doado' }).eq('id', livro_id);
-  }
-
-  const { data, error } = await supabase
-    .from('doacoes')
-    .insert([{ livro_id: finalLivroId, tipo, doador_ou_destinatario }])
-    .select();
-
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
-});
-
-// ==========================================
-//          INICIALIZAÇÃO DO SERVIDOR
-// ==========================================
+// Inicialização segura do servidor Express
 app.listen(PORT, () => {
   console.log(`\n==================================================`);
-  console.log(`🚀 Sistema COMPLETO: Módulo de Cadastro de Leitores Ativo!`);
-  console.log(`🚀 Área Federativa`);
-  console.log(`Desenvolvido por Adriana Pedrogao`);
-  console.log(`👉 Acesse no seu navegador: http://localhost:${PORT}`);
+  console.log(`🚀 Servidor rodando com sucesso em: http://localhost:${PORT}`);
+  console.log(`👉 Desenvolvido por: Adriana Pedrogão - FEESP`);
   console.log(`==================================================\n`);
+}).on('error', (err) => {
+    console.error("❌ Erro fatal ao ligar o servidor:", err.message);
 });
